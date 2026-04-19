@@ -1,0 +1,292 @@
+---
+title: "Projekt Tymon Jakubowski wersja 2.0"
+author: "Tymon Jakubowski"
+date: "2025-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Opis danych i cel projektu
+
+Zbiór danych zawiera informacje o pacjentach z niewydolnością serca. Opis zmiennych:
+
+| Zmienna                  | Opis |
+|--------------------------|------|
+| age                      | Wiek pacjenta |
+| anaemia                  | Niedokrwistość (0 = nie, 1 = tak) |
+| creatinine_phosphokinase | Poziom enzymu CPK |
+| diabetes                 | Cukrzyca (0 = nie, 1 = tak) |
+| ejection_fraction        | Frakcja wyrzutowa serca |
+| high_blood_pressure      | Nadciśnienie (0 = nie, 1 = tak) |
+| platelets                | Liczba płytek krwi |
+| serum_creatinine         | Poziom kreatyniny |
+| serum_sodium             | Poziom sodu |
+| sex                      | Płeć (0 = kobieta, 1 = mężczyzna) |
+| smoking                  | Palenie papierosów (0 = nie, 1 = tak) |
+| time                     | Czas obserwacji (dni) |
+| DEATH_EVENT              | Zgon pacjenta (0 = przeżył, 1 = zmarł) |
+
+Celem projektu:
+
+1.Dokonanie kompleksowego opisu statystycznego zmiennych
+
+2.Wykrycie obserwacji odstających oraz ocena rozkładów (normalność, wielomodalność)
+
+3.Analiza korelacji i redukcja wymiarowości (PCA)
+
+4.Klasteryzacja danych – tutaj przed użyciem k-średnich dane ciągłe są przeskalowane
+
+5.Klasyfikacja pod nadzorem (Random Forest) w celu identyfikacji najważniejszych cech wpływających na ryzyko zgonu
+
+## Ładowanie pakietów
+```{r}
+library(cluster)
+library(randomForest)
+library(moments)
+library(outliers)
+library(nortest)
+library(heatmaply)
+library(diptest)
+```
+
+## Wczytanie danych
+```{r}
+dane <- read.csv("heart_failure_clinical_records_data.txt", header = TRUE, skip = 1, comment.char = "#", check.names = FALSE)
+cat("Liczba obserwacji:", nrow(dane), "\n")
+cat("Liczba zmiennych:", ncol(dane), "\n")
+cat("\nPierwsze 5 wierszy:\n")
+print(head(dane, 5))
+```
+
+### Konwersja zmiennych binarnych na factor
+```{r}
+# Lista zmiennych binarnych, które traktujemy jako kategorie
+binary_vars <- c("anaemia", "diabetes", "high_blood_pressure", "sex", "smoking", "DEATH_EVENT")
+dane[binary_vars] <- lapply(dane[binary_vars], function(x) as.factor(x))
+
+# Podsumowanie zmiennych binarnych (ile 0, a ile 1)
+cat("\n--- PODSUMOWANIE ZMIENNYCH BINARNYCH ---\n")
+for(var in binary_vars) {
+  cat("\nZmienna:", var, "\n")
+  print(table(dane[[var]]))
+}
+```
+
+## Statystyki sumaryczne dla zmiennych ciągłych
+```{r}
+
+continuous_vars <- setdiff(names(dane), binary_vars)
+zmienne_cont <- dane[, continuous_vars]
+
+cat("\n--- STATYSTYKI SUMARYCZNE (zmienne ciągłe) ---\n")
+print(apply(zmienne_cont, 2, summary))
+
+cat("\n--- ODCHYLENIE STANDARDOWE (zmienne ciągłe) ---\n")
+print(apply(zmienne_cont, 2, sd))
+
+cat("\n--- SKOŚNOŚĆ (zmienne ciągłe) ---\n")
+print(apply(zmienne_cont, 2, skewness))
+```
+WNIOSKI
+
+1.Wiek (age): Mediana = 60 lat, zakres 40–95 lat. Występują pacjenci w zaawansowanym wieku (np. 95 lat), co może wskazywać na grupę wysokiego ryzyka.
+
+2.CPK (creatinine_phosphokinase): Średnia = 581.3, ale wartość maksymalna = 9.4 (ekstremalne odchylenie). Sugeruje to obecność skrajnych wartości odstających (np. 7861, 7702).
+
+3.Frakcja wyrzutowa (ejection_fraction): Mediana = 38%, ale wartości skrajne (15–80%) wskazują na dużą różnorodność stanu serca pacjentów.
+
+## Histogramy
+```{r}
+par(mfrow = c(3, 4))
+for(i in 1:ncol(zmienne_cont)) {
+  hist(zmienne_cont[, i], 
+       main = colnames(zmienne_cont)[i],
+       xlab = "",
+       breaks = 10,
+       col = "lightblue")
+}
+```
+
+## Testy normalności
+```{r}
+cat("\n--- TESTY NORMALNOŚCI (Shapiro-Wilka) ---\n")
+print(shapiro.test(dane$age))
+print(shapiro.test(dane$serum_creatinine))
+print(shapiro.test(dane$ejection_fraction))
+print(shapiro.test(dane$platelets))
+```
+WNIOSKI
+
+Wszystkie zmienne ciągłe (wiek, kreatynina, frakcja wyrzutowa, płytki krwi) mają p-value < 0.05 → odrzucamy hipotezę o normalności rozkładu.
+
+## Testy wielomodalności (Hartigan's Dip Test)
+```{r}
+cat("\n--- TESTY WIELOMODALNOŚCI (Hartigan's Dip Test) ---\n")
+print(dip.test(dane$age))
+print(dip.test(dane$creatinine_phosphokinase))
+print(dip.test(dane$ejection_fraction))
+```
+WNIOSKI
+
+1.CPK (creatinine_phosphokinase): p-value = 0.003 → silna wielomodalność. Może to wynikać z różnic w stopniu uszkodzenia mięśni u pacjentów.
+
+2.Frakcja wyrzutowa (ejection_fraction): p-value = 0.02 → wielomodalność. Sugeruje istnienie podgrup pacjentów (np. z łagodną/ciężką dysfunkcją serca).
+
+3.Wiek (age): p-value = 0.15 → brak dowodów na wielomodalność.
+
+## Test Grubbsa dla wartości odstających
+```{r}
+cat("\n--- TEST GRUBBSA DLA OBSERWACJI ODSTAJĄCYCH ---\n")
+for(var in continuous_vars) {
+  cat("\nZmienna:", var, "\n")
+  print(grubbs.test(dane[[var]]))
+}
+```
+WNIOSKI
+
+1.CPK: Wartości > 4000 (np. 7861, 7702) są statystycznie istotnymi outlierami (p-value < 0.001).
+
+2.Płytki krwi (platelets): Pacjent z wartością 25,100 → potencjalny błąd pomiaru lub rzadki przypadek kliniczny.
+
+Podsumowanie: Większość zmiennych ma wartości odstające, które mogą zaburzać wyniki modeli (np. zawyżać wariancję).
+
+## Analiza korelacji i PCA
+```{r}
+# Macierz korelacji
+cor_matrix <- cor(zmienne_cont, method = "pearson")
+heatmaply_cor(cor_matrix, main = "Macierz korelacji zmiennych ciągłych")
+
+# Analiza PCA 
+pca <- prcomp(zmienne_cont, scale. = TRUE)
+cat("\n--- PODSUMOWANIE PCA ---\n")
+print(summary(pca))
+
+cat("\n--- ŁADUNKI PIERWSZEJ SKŁADOWEJ ---\n")
+print(round(pca$rotation[, 1], 4))
+
+# Wizualizacja PCA w przestrzeni 3D
+df_pca <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  PC3 = pca$x[, 3],
+  DEATH_EVENT = dane$DEATH_EVENT
+)
+
+plot_ly(df_pca, 
+        x = ~PC1, 
+        y = ~PC2, 
+        z = ~PC3,
+        color = ~DEATH_EVENT,
+        colors = c("#1f77b4", "#ff7f0e"),
+        type = "scatter3d",
+        mode = "markers",
+        marker = list(size = 4)) %>%
+  layout(title = "Przestrzeń PCA z podziałem na DEATH_EVENT")
+
+```
+WNIOSKI
+
+1). Silne korelacje:
+
+-ejection_fraction i serum_creatinine (r = -0.26) → niższa frakcja wyrzutowa wiąże się z wyższym poziomem kreatyniny.
+
+-age i serum_creatinine (r = 0.16) → starsi pacjenci mają wyższy poziom kreatyniny.
+
+2). PCA:
+
+-PC1 (wyjaśnia 22% wariancji): Największe ładunki: serum_creatinine (+), ejection_fraction (-), age (+).
+
+-PC2 (14% wariancji): Dominują platelets (-) i serum_sodium (+).
+
+-PC3 (12% wariancji): Głównie creatinine_phosphokinase (+).
+
+Wizualizacja 3D: Brak wyraźnej separacji między grupami "zmarli" a "przeżyli", ale pacjenci z DEATH_EVENT=1 są skupieni w obszarach z niższymi wartościami PC1 (wyższa kreatynina, niższa frakcja wyrzutowa).
+
+## Klasteryzacja bez nadzoru - K-means
+```{r}
+zmienne_cont_scaled <- scale(zmienne_cont)
+
+set.seed(123)
+kmeans_model <- kmeans(zmienne_cont_scaled, centers = 2, nstart = 10)
+cat("\n--- TABELA KONTYNGENCJI: K-means vs DEATH_EVENT ---\n")
+print(table(kmeans_model$cluster, dane$DEATH_EVENT))
+```
+
+## optymalizacja liczby klastów 
+```{r}
+wss <- sapply(1:10, function(k) kmeans(zmienne_cont_scaled, centers = k, nstart = 10)$tot.withinss)
+plot(1:10, wss, type = "b", main = "Metoda łokcia", xlab = "Liczba klastrów", ylab = "Suma kwadratów wewnątrz klastrów")
+```
+WNIOSKI
+
+1).Optymalna liczba klastrów: Metoda łokcia wskazuje k=3 (spadek WSS stabilizuje się od 3 klastrów).
+
+2).Dla k=2:
+
+-Klaster 0: 70% przeżyli, 30% zmarli.
+
+-Klaster 1: 45% przeżyli, 55% zmarli.
+
+Wnioski: Klasteryzacja częściowo odzwierciedla podział na grupy ryzyka, ale DEATH_EVENT nie jest jednoznacznie powiązana z klastrami.
+## Klasyfikacja pod nadzorem - Random Forest
+```{r}
+# dane z uwzględnieniem zmiennych ciągłych i binarnych
+dane_rf <- dane
+
+# Walidacja krzyżowa
+rf_cv <- rfcv(zmienne_cont, dane$DEATH_EVENT)
+cat("\n--- BŁĄD WALIDACJI KRZYŻOWEJ ---\n")
+print(rf_cv$error.cv)
+
+# model Random Forest .
+rf_model <- randomForest(DEATH_EVENT ~ ., data = dane_rf, importance = TRUE)
+cat("\n--- WYKRES WAŻNOŚCI CECH ---\n")
+varImpPlot(rf_model)
+```
+
+
+
+WNIOSKI
+Najważniejsze zmienne:
+
+a). ejection_fraction (MeanDecreaseGini = 12.5),
+
+b). serum_creatinine (10.8),
+
+c). age (9.3).
+
+Czułość (sensytywność): 68% dla DEATH_EVENT=1 → model lepiej wykrywa pacjentów niskiego ryzyka.
+## Wnioski końcowe
+
+1.Charakterystyka danych:
+
+-Dane są silnie nienormalne i zawierają liczne wartości odstające (szczególnie CPK, kreatynina).
+
+-Wielomodalność CPK i frakcji wyrzutowej sugeruje istnienie podgrup pacjentów (np. z różnym stopniem uszkodzenia mięśnia sercowego).
+
+2.Kluczowe predyktory zgonu:
+
+-Frakcja wyrzutowa (niższa → wyższe ryzyko),
+
+-Poziom kreatyniny (wyższy → ryzyko niewydolności nerek i serca),
+
+-Wiek (starsze osoby są bardziej narażone).
+
+3.PCA i klasteryzacja:
+
+-Redukcja wymiarowości nie wyjaśnia w pełni zmienności (60% dla 3 składowych), ale wskazuje na kluczowe zmienne.
+
+4.Random Forest:
+
+-Model jest solidny, ale niedoskonały w wykrywaniu pacjentów wysokiego ryzyka.
+
+5.Rekomendacje dla praktyki klinicznej:
+
+-Monitorowanie kreatyniny i frakcji wyrzutowej u starszych pacjentów.
+
+-Weryfikacja wartości odstających (np. czy CPK = 7861 to błąd pomiaru).
+
+Finalny komentarz: Analiza potwierdza kliniczne znaczenie wybranych biomarkerów, ale wymaga uzupełnienia o dane z większej próby i usunięcia skrajnych outlierów.
